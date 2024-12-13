@@ -1,4 +1,4 @@
-import { OSCArgument } from '@mxfriend/osc';
+import { isOSCType, OSCArgument, OSCType, OSCValue, SubscriptionHandler } from '@mxfriend/osc';
 import { UdpOSCPeer, UdpOSCPort, UdpOSCPortOptions } from '@mxfriend/osc/udp';
 import { stdin, stdout } from 'node:process';
 import { createInterface } from 'node:readline';
@@ -12,6 +12,7 @@ export class ReplRunner {
   public peer?: UdpOSCPeer;
 
   private readonly port: UdpOSCPort;
+  private readonly subscriptions: Map<string, Set<SubscriptionHandler>> = new Map();
   private readonly io: ReadLine;
   private readonly commands: CommandMap = {};
   private readonly parsers: ParserMap = {};
@@ -63,9 +64,18 @@ export class ReplRunner {
       this.terminating || this.io.prompt();
     });
 
-    this.port.on('message', (msg) => {
-      println(`> ${msg.address} ${this.formatArgs(msg.args).join(' ')}`);
-      this.io.prompt(true);
+    this.port.on('message', (msg, peer) => {
+      const handlers = this.subscriptions.get(msg.address);
+
+      if (!handlers) {
+        println(`> ${msg.address} ${this.formatArgs(msg.args).join(' ')}`);
+        this.io.prompt(true);
+        return;
+      }
+
+      for (const handler of handlers) {
+        handler(msg, peer);
+      }
     });
 
     await this.port.open();
@@ -82,6 +92,10 @@ export class ReplRunner {
 
   registerFormatters(formatters: FormatterMap): void {
     Object.assign(this.formatters, formatters);
+  }
+
+  getCommands(): Readonly<CommandMap> {
+    return this.commands;
   }
 
   parseLine(line: string): [command?: string, args?: any[]] {
@@ -134,8 +148,52 @@ export class ReplRunner {
     return formatted;
   }
 
+  subscribe(address: string, handler: SubscriptionHandler): void {
+    const handlers = this.subscriptions.get(address) ?? new Set();
+    this.subscriptions.set(address, handlers);
+    handlers.add(handler);
+  }
+
+  unsubscribe(address?: string, handler?: SubscriptionHandler): void {
+    if (address === undefined) {
+      return this.subscriptions.clear();
+    }
+
+    const handlers = this.subscriptions.get(address);
+
+    if (handler) {
+      handlers?.delete(handler);
+    } else {
+      handlers?.clear();
+    }
+
+    if (handlers && !handlers.size) {
+      this.subscriptions.delete(address);
+    }
+  }
+
   async send(address: string, args?: OSCArgument[]): Promise<void> {
     await this.port.send(address, args, this.peer);
+  }
+
+  async query<T extends OSCType>(address: string, type: T): Promise<OSCValue<T>> {
+    const tmr = setInterval(async () => {
+      await this.send(address);
+    }, 50);
+
+    return new Promise((resolve, reject) => {
+      const to = setTimeout(reject, 5000);
+
+      this.subscribe(address, ({ args: [arg] }) => {
+        if (!isOSCType(arg, type)) {
+          return;
+        }
+
+        clearInterval(tmr);
+        clearTimeout(to);
+        resolve(arg.value as OSCValue<T>);
+      });
+    });
   }
 
   async terminate(): Promise<void> {
